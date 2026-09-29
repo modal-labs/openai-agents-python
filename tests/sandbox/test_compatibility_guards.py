@@ -455,6 +455,7 @@ def test_optional_sandbox_dataclass_constructor_field_order_is_stable(
                 "idle_timeout",
                 "cpu",
                 "memory",
+                "runtime",
             ),
         ),
         (
@@ -634,6 +635,7 @@ def test_optional_sandbox_client_options_positional_field_order_is_stable(
                 "idle_timeout",
                 "cpu",
                 "memory",
+                "runtime",
             ),
         ),
         (

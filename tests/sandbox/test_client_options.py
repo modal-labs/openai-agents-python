@@ -74,6 +74,7 @@ def test_sandbox_client_options_exclude_unset_preserves_type_discriminator() -> 
         "idle_timeout": None,
         "cpu": None,
         "memory": None,
+        "runtime": None,
     }
 
 

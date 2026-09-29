@@ -13,7 +13,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn, cast
 
 import pytest
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, ValidationError
 
 from agents.sandbox import Manifest
 from agents.sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
@@ -556,6 +556,50 @@ async def test_modal_sandbox_create_passes_resources(
     assert create_calls[0]["memory"] == memory
     assert session.state.cpu == cpu
     assert session.state.memory == memory
+
+
+@pytest.mark.parametrize("runtime", [None, "gvisor", "vm"])
+@pytest.mark.asyncio
+async def test_modal_sandbox_runtime_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, runtime: str | None
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    client = modal_module.ModalSandboxClient()
+    options = modal_module.ModalSandboxClientOptions.model_validate(
+        {"app_name": "sandbox-tests", "runtime": runtime}
+    )
+
+    session = await client.create(options=options)
+    restored = client.deserialize_session_state(client.serialize_session_state(session.state))
+
+    assert create_calls[0]["runtime"] == runtime
+    assert restored.runtime == runtime
+
+
+def test_modal_runtime_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+
+    with pytest.raises(ValidationError, match="runtime"):
+        modal_module.ModalSandboxClientOptions(app_name="sandbox-tests", runtime="unknown")
+
+    assert create_calls == []
+
+
+def test_modal_deserialize_session_state_defaults_missing_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+    )
+    payload = state.model_dump(mode="json")
+    payload.pop("runtime")
+
+    restored = modal_module.ModalSandboxClient().deserialize_session_state(payload)
+
+    assert restored.runtime is None
 
 
 @pytest.mark.asyncio
@@ -1583,6 +1627,7 @@ async def test_modal_resume_resets_workspace_readiness_when_sandbox_is_recreated
         sandbox_id="sb-stopped",
         workspace_root_ready=True,
         image_builder_version="PREVIEW",
+        runtime="vm",
     )
 
     client = modal_module.ModalSandboxClient()
@@ -1592,6 +1637,7 @@ async def test_modal_resume_resets_workspace_readiness_when_sandbox_is_recreated
     assert state.workspace_root_ready is False
     assert create_calls
     assert create_calls[0]["modal_image_builder_version_env"] == "PREVIEW"
+    assert create_calls[0]["runtime"] == "vm"
     assert state.sandbox_id == "sb-123"
     assert os.environ.get("MODAL_IMAGE_BUILDER_VERSION") is None
 
@@ -3525,6 +3571,7 @@ async def test_modal_snapshot_filesystem_restore_preserves_exposed_ports(
         idle_timeout=60,
         cpu=(1.0, 4.0),
         memory=(2048, 8192),
+        runtime="vm",
     )
     session = modal_module.ModalSandboxSession.from_state(state)
     call_names: list[str] = []
@@ -3553,6 +3600,7 @@ async def test_modal_snapshot_filesystem_restore_preserves_exposed_ports(
     assert create_calls[0]["idle_timeout"] == 60
     assert create_calls[0]["cpu"] == (1.0, 4.0)
     assert create_calls[0]["memory"] == (2048, 8192)
+    assert create_calls[0]["runtime"] == "vm"
     assert sys.modules["modal"].Image.from_id_calls == ["snap-123"]
     assert call_names == []
     assert call_timeouts == []

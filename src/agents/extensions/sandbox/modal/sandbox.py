@@ -50,6 +50,7 @@ from ....sandbox.errors import (
     SandboxError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
+    WorkspaceReadNotFoundError,
     WorkspaceStartError,
     WorkspaceStopError,
     WorkspaceWriteTypeError,
@@ -299,6 +300,7 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
     idle_timeout: int | None = None
     cpu: float | tuple[float, float] | None = None
     memory: int | tuple[int, int] | None = None
+    runtime: Literal["gvisor", "vm"] | None = None
 
     def __init__(
         self,
@@ -317,6 +319,7 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
         cpu: float | tuple[float, float] | None = None,
         memory: int | tuple[int, int] | None = None,
         type: Literal["modal"] = "modal",
+        runtime: Literal["gvisor", "vm"] | None = None,
     ) -> None:
         super().__init__(
             type=type,
@@ -333,6 +336,7 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
             idle_timeout=idle_timeout,
             cpu=cpu,
             memory=memory,
+            runtime=runtime,
         )
 
 
@@ -469,6 +473,7 @@ class ModalSandboxSessionState(SandboxSessionState):
     idle_timeout: int | None = None
     cpu: float | tuple[float, float] | None = None
     memory: int | tuple[int, int] | None = None
+    runtime: Literal["gvisor", "vm"] | None = None
 
     def _sanitize_persisted_provider_identity(
         self,
@@ -747,6 +752,7 @@ class ModalSandboxSession(BaseSandboxSession):
             gpu=self.state.gpu,
             cpu=self.state.cpu,
             memory=self.state.memory,
+            runtime=self.state.runtime,
             timeout=self.state.timeout,
             idle_timeout=self.state.idle_timeout,
         )
@@ -1251,30 +1257,24 @@ class ModalSandboxSession(BaseSandboxSession):
     async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
         try:
             workspace_path = await self._validate_path_access(path)
-            await self._ensure_sandbox()
-            assert self._sandbox is not None
-            # Each read starts a remote operation. Use Modal's 100 MiB per-read
-            # ceiling while respecting the caller's remaining byte budget.
-            stream = await self._sandbox.open.aio(sandbox_path_str(workspace_path), "rb")
-            completed = False
-            try:
-                result = bytearray()
-                while len(result) < max_bytes:
-                    chunk = await stream.read.aio(min(100 * 1024 * 1024, max_bytes - len(result)))
-                    if not chunk:
-                        break
-                    result.extend(chunk)
-                payload = bytes(result)
-                completed = True
-                return payload
-            finally:
-                try:
-                    await asyncio.wait_for(stream.close.aio(), timeout=5.0)
-                except Exception:
-                    # Preserve an active read failure or cancellation. A close failure
-                    # still fails a read that would otherwise have completed.
-                    if completed:
-                        raise
+            # Bound acquisition inside the sandbox before buffering exec output.
+            # Use image-owned utilities independently of the manifest PATH.
+            result = await self.exec(
+                "/bin/sh",
+                "-c",
+                "PATH=/usr/bin:/bin; export PATH; "
+                '[ -e "$1" ] || exit 44; [ -f "$1" ] || exit 45; head -c "$2" < "$1"',
+                "sh",
+                sandbox_path_str(workspace_path),
+                str(max_bytes),
+                shell=False,
+                timeout=30.0,
+            )
+            if result.exit_code == 44:
+                raise WorkspaceReadNotFoundError(path=path)
+            if not result.ok():
+                raise WorkspaceArchiveReadError(path=path)
+            return result.stdout
         except (FileNotFoundError, SandboxError):
             raise
         except Exception as error:
@@ -1937,6 +1937,7 @@ class ModalSandboxSession(BaseSandboxSession):
                 gpu=self.state.gpu,
                 cpu=self.state.cpu,
                 memory=self.state.memory,
+                runtime=self.state.runtime,
                 timeout=self.state.timeout,
                 idle_timeout=self.state.idle_timeout,
             )
@@ -2195,6 +2196,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
         - cpu: float | tuple[float, float] | None (CPU request or request/limit pair)
         - memory: int | tuple[int, int] | None (memory request or request/limit pair in MiB)
         - image_builder_version: str | None (Modal image builder version, default "2025.06")
+        - runtime: Literal["gvisor", "vm"] | None (sandbox runtime; None lets Modal choose)
         """
 
         if options is None:
@@ -2319,6 +2321,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
             idle_timeout=options.idle_timeout,
             cpu=options.cpu,
             memory=options.memory,
+            runtime=options.runtime,
         )
         if sandbox_create_timeout_s is not None:
             state.sandbox_create_timeout_s = float(sandbox_create_timeout_s)

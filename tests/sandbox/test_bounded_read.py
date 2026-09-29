@@ -217,11 +217,17 @@ async def test_cloudflare_bounded_read_limits_encoded_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_docker_bounded_read_uses_trusted_utilities_without_encoding() -> None:
-    pytest.importorskip("docker")
-    from agents.sandbox.sandboxes.docker import DockerSandboxSession
+@pytest.mark.parametrize("provider", ["docker", "modal"])
+async def test_exec_bounded_read_uses_trusted_utilities_without_encoding(provider: str) -> None:
+    pytest.importorskip(provider)
+    if provider == "docker":
+        from agents.sandbox.sandboxes.docker import DockerSandboxSession
 
-    session = object.__new__(DockerSandboxSession)
+        session = object.__new__(DockerSandboxSession)
+    else:
+        from agents.extensions.sandbox.modal.sandbox import ModalSandboxSession
+
+        session = object.__new__(ModalSandboxSession)
     session._validate_path_access = AsyncMock(return_value=Path("/workspace/out.jsonl"))
     session.exec = AsyncMock(
         return_value=ExecResult(stdout=b"\x00\xffabc", stderr=b"", exit_code=0)
@@ -236,68 +242,23 @@ async def test_docker_bounded_read_uses_trusted_utilities_without_encoding() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "close_error", [None, RuntimeError("Close failed"), asyncio.TimeoutError()]
-)
-async def test_modal_bounded_read_closes_provider_descriptor(close_error: Exception | None) -> None:
+@pytest.mark.parametrize("exit_code", [44, 45, 1])
+async def test_modal_bounded_read_rejects_missing_or_unreadable_files(exit_code: int) -> None:
     pytest.importorskip("modal")
     from agents.extensions.sandbox.modal.sandbox import ModalSandboxSession
 
     session = object.__new__(ModalSandboxSession)
     session._validate_path_access = AsyncMock(return_value=Path("/workspace/out.jsonl"))
-    session._ensure_sandbox = AsyncMock()
-    stream = SimpleNamespace(
-        read=SimpleNamespace(aio=AsyncMock(return_value=b"abc")),
-        close=SimpleNamespace(aio=AsyncMock(side_effect=close_error)),
+    session.exec = AsyncMock(
+        return_value=ExecResult(
+            stdout=b"", stderr=b"synthetic-private-response", exit_code=exit_code
+        )
     )
-    session._sandbox = SimpleNamespace(open=SimpleNamespace(aio=AsyncMock(return_value=stream)))
-    if close_error is None:
-        assert await session.read_bounded(Path("out.jsonl"), max_bytes=3) == b"abc"
-    else:
-        with pytest.raises(WorkspaceArchiveReadError) as caught:
-            await session.read_bounded(Path("out.jsonl"), max_bytes=3)
-        assert caught.value.context["reason"] == "bounded_read_failed"
-        assert caught.value.__context__ is None
-    stream.read.aio.assert_awaited_once_with(3)
-    stream.close.aio.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "limit,expected_requests",
-    [
-        (4 * 1024 * 1024, [4 * 1024 * 1024]),
-        (8 * 1024 * 1024 + 1, [8 * 1024 * 1024 + 1, 4 * 1024 * 1024 + 1]),
-        (101 * 1024 * 1024, [100 * 1024 * 1024, 97 * 1024 * 1024]),
-    ],
-)
-async def test_modal_bounded_read_uses_large_bounded_requests(
-    limit: int, expected_requests: list[int]
-) -> None:
-    pytest.importorskip("modal")
-    from agents.extensions.sandbox.modal.sandbox import ModalSandboxSession
-
-    session = object.__new__(ModalSandboxSession)
-    session._validate_path_access = AsyncMock(return_value=Path("/workspace/out.jsonl"))
-    session._ensure_sandbox = AsyncMock()
-    history = b"x" * (4 * 1024 * 1024)
-    remaining = history
-
-    async def read(size: int) -> bytes:
-        nonlocal remaining
-        chunk, remaining = remaining[:size], remaining[size:]
-        return chunk
-
-    stream = SimpleNamespace(
-        read=SimpleNamespace(aio=AsyncMock(side_effect=read)),
-        close=SimpleNamespace(aio=AsyncMock()),
-    )
-    session._sandbox = SimpleNamespace(open=SimpleNamespace(aio=AsyncMock(return_value=stream)))
-    assert await session.read_bounded(Path("out.jsonl"), max_bytes=limit) == history
-    requests = [call.args[0] for call in stream.read.aio.await_args_list]
-    assert requests == expected_requests
-    assert all(size <= 100 * 1024 * 1024 for size in requests)
-    stream.close.aio.assert_awaited_once()
+    error_cls = WorkspaceReadNotFoundError if exit_code == 44 else WorkspaceArchiveReadError
+    with pytest.raises(error_cls) as caught:
+        await session.read_bounded(Path("out.jsonl"), max_bytes=3)
+    assert "synthetic-private-response" not in str(caught.value)
+    assert caught.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -361,7 +322,6 @@ async def test_bounded_provider_read_preserves_retry_policy(
     from agents.sandbox.snapshot import NoopSnapshot
 
     content = _Content(b"synthetic-private-response")
-    close = AsyncMock()
     inner: Any
     if provider == "modal":
         modal = pytest.importorskip("modal")
@@ -373,13 +333,7 @@ async def test_bounded_provider_read_preserves_retry_policy(
         error_cls = (
             modal.exception.InternalError if retryable else modal.exception.PermissionDeniedError
         )
-        stream = SimpleNamespace(
-            read=SimpleNamespace(
-                aio=AsyncMock(side_effect=error_cls("synthetic-private-response"))
-            ),
-            close=SimpleNamespace(aio=close),
-        )
-        inner._sandbox = SimpleNamespace(open=SimpleNamespace(aio=AsyncMock(return_value=stream)))
+        inner.exec = AsyncMock(side_effect=error_cls("synthetic-private-response"))
     else:
         inner = _session(provider, content, status=503 if retryable else 403)
     inner.state = SandboxSessionState(
@@ -443,8 +397,6 @@ async def test_bounded_provider_read_preserves_retry_policy(
     if provider in {"cloudflare", "daytona", "blaxel"}:
         assert content.closed
         assert content.offset == 0
-    elif provider == "modal":
-        close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -581,34 +533,30 @@ async def test_e2b_bounded_read_closes_real_sdk_stream() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "close_error", [None, RuntimeError("Close failed"), asyncio.TimeoutError()]
-)
-async def test_modal_bounded_read_cancellation_closes_descriptor(
-    close_error: Exception | None,
-) -> None:
+async def test_modal_bounded_read_propagates_cancellation() -> None:
     pytest.importorskip("modal")
     from agents.extensions.sandbox.modal.sandbox import ModalSandboxSession
 
     entered = asyncio.Event()
+    cancelled = asyncio.Event()
 
-    async def read(size: int) -> bytes:
+    async def exec_command(*args: object, **kwargs: object) -> ExecResult:
         entered.set()
-        await asyncio.Event().wait()
-        return b"unreachable"
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return ExecResult(stdout=b"unreachable", stderr=b"", exit_code=0)
 
     session: Any = object.__new__(ModalSandboxSession)
     session._validate_path_access = AsyncMock(return_value=Path("/workspace/out.jsonl"))
-    session._ensure_sandbox = AsyncMock()
-    close = AsyncMock(side_effect=close_error)
-    stream = SimpleNamespace(read=SimpleNamespace(aio=read), close=SimpleNamespace(aio=close))
-    session._sandbox = SimpleNamespace(open=SimpleNamespace(aio=AsyncMock(return_value=stream)))
+    session.exec = AsyncMock(side_effect=exec_command)
     task = asyncio.create_task(session.read_bounded(Path("out.jsonl"), max_bytes=5))
     await asyncio.wait_for(entered.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    close.assert_awaited_once()
+    assert cancelled.is_set()
 
 
 @pytest.mark.asyncio
