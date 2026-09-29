@@ -269,11 +269,10 @@ format-command = "ruff format --stdin-filename {filename}"
 
 [tool.uv]
 exclude-newer = "7 days"
-# Modal 1.6.0 pin requested by Jonathon; remove its exception after 2026-10-06.
-exclude-newer-package = { openai = false, modal = "2026-09-29T01:17:12Z" }
+exclude-newer-package = { openai = false }
 index-strategy = "first-index"
 
 [tool.uv.pip]
 exclude-newer = "7 days"
-exclude-newer-package = { openai = false, modal = "2026-09-29T01:17:12Z" }
+exclude-newer-package = { openai = false }
 index-strategy = "first-index"
